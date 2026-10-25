@@ -1,0 +1,6 @@
+1. Extract ALL contents of this ZIP.
+2. Close APMHSS timetable app.
+3. Run IMPORT_EXISTING_DATA.bat and choose the old data\school_timetable.sqlite3.
+4. Run BUILD_SINGLE_EXE.bat in this folder.
+5. Find the built app in SINGLE_EXE_READY\APMHSS_Time_Table.exe.
+Do not delete or rename BUILD_SINGLE_EXE.py.
