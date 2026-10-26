@@ -96,12 +96,11 @@ def _atomic_write(path, raw):
 class _ProcessLock:
     def __init__(self, path):
         self.stream = open(str(path) + '.lock', 'a+b')
-        self.stream.seek(0)
-        if self.stream.read(1) == b'':
-            self.stream.write(b'0')
-            self.stream.flush()
-        self.stream.seek(0)
         try:
+            if os.fstat(self.stream.fileno()).st_size == 0:
+                self.stream.write(b'0')
+                self.stream.flush()
+            self.stream.seek(0)
             if os.name == 'nt':
                 import msvcrt
                 msvcrt.locking(self.stream.fileno(), msvcrt.LK_NBLCK, 1)

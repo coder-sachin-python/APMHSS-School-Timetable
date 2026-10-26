@@ -7,6 +7,7 @@ assignment data must be entered to make clash checks meaningful.
 from __future__ import annotations
 from storage_security import (connect_database, configure_backups, backup_database,
                               security_schema, secure_login, issue_recovery_codes, recover_account)
+from contextlib import closing
 import hashlib
 import json
 import sys
@@ -133,7 +134,7 @@ class Store:
                 if not source_path.is_file() or source_path.resolve() == self.path:
                     continue
                 try:
-                    with sqlite3.connect(str(source_path)) as source:
+                    with closing(sqlite3.connect(str(source_path))) as source:
                         def columns(table):
                             return {row[1] for row in source.execute(f'PRAGMA table_info({table})')}
                         compatible = (
@@ -144,7 +145,7 @@ class Store:
                         )
                         if not compatible:
                             continue
-                        with sqlite3.connect(str(self.path)) as destination:
+                        with closing(sqlite3.connect(str(self.path))) as destination:
                             source.backup(destination)
                     break
                 except sqlite3.DatabaseError:

@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,9 +79,10 @@ class LegacyAccountMigrationTests(unittest.TestCase):
             path = Path(tmp) / 'legacy.sqlite3'
             salt = os.urandom(16)
             digest = hashlib.pbkdf2_hmac('sha256', b'OldPassword123', salt, 250000)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute('CREATE TABLE users (username TEXT PRIMARY KEY, salt BLOB, digest BLOB)')
                 db.execute('INSERT INTO users VALUES (?,?,?)', ('admin',salt,digest))
+                db.commit()
             db = Store(path)
             try:
                 self.assertEqual(db.login('admin','OldPassword123'),'admin')

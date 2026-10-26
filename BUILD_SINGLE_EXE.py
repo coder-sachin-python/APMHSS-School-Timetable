@@ -20,7 +20,7 @@ def valid_database(db_path):
     if not db_path.is_file():
         return False
     try:
-        with sqlite3.connect(str(db_path)) as db:
+        with closing(sqlite3.connect(str(db_path))) as db:
             def columns(table):
                 return {r[1] for r in db.execute(f'PRAGMA table_info({table})')}
             return ({'username','salt'} <= columns('users')
