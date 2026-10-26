@@ -1,0 +1,39 @@
+name: Windows EXE
+on:
+  push:
+    branches: [fix/school-reliability-security]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt pyinstaller
+      - run: python -m unittest discover -v
+      - name: Build application without private database
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name APMHSS_Time_Table
+          --icon Adhiparasakthi_Time_Table_Icon.ico
+          --add-data "school_logo.png;."
+          --add-data "school_photo.jpg;."
+          --add-data "Adhiparasakthi_Time_Table_Icon.ico;."
+          CLASS_TIME_TABLE_GENERATOR.py
+      - name: Check packaged application starts
+        run: python -c "import subprocess; subprocess.run(['dist/APMHSS_Time_Table.exe', '--smoke-test'], check=True, timeout=60)"
+      - name: Record checksum
+        shell: pwsh
+        run: (Get-FileHash dist/APMHSS_Time_Table.exe -Algorithm SHA256).Hash | Out-File dist/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: APMHSS-Windows-EXE
+          path: |
+            dist/APMHSS_Time_Table.exe
+            dist/SHA256.txt
+            REPAIR_STATUS.md
+          if-no-files-found: error
