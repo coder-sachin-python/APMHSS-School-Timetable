@@ -176,6 +176,7 @@ class App:
     def login_screen(self):
         """Original APMHSS full-photo login design with improved secure accounts."""
         self.reset_root()
+        ttk.Button(self.root,text='Forgot password / recovery code',command=self.forgot_password).pack(side='bottom')
         cv = tk.Canvas(self.root, bg='#07111F', highlightthickness=0, bd=0)
         cv.pack(fill='both', expand=True)
         self._login_canvas = cv
@@ -240,19 +241,40 @@ class App:
             messagebox.showerror('Password requirements',str(err));self.root.after(150,self.first_run);return
         messagebox.showinfo('Administrator created','Admin username: admin\nUse your new password to sign in.')
 
+    def forgot_password(self):
+        username=simpledialog.askstring('Recover account','Username:',parent=self.root)
+        if not username:return
+        code=simpledialog.askstring('Recover account','One-use recovery code:',show='*',parent=self.root)
+        if not code:return
+        password=simpledialog.askstring('Recover account','New password (8+ characters, letters and numbers):',show='*',parent=self.root)
+        if password is None:return
+        try:
+            ok=self.store.recover(username,code,password)
+        except ValueError as error:
+            messagebox.showerror('Recovery',str(error));return
+        messagebox.showinfo('Recovery','Password changed.' if ok else 'Invalid code or recovery temporarily locked.')
+
+    def create_recovery_codes(self):
+        password=simpledialog.askstring('Recovery codes','Confirm your current password:',show='*',parent=self.root)
+        if password is None or not self.store.login(self.user,password):
+            messagebox.showerror('Recovery codes','Authentication failed.');return
+        codes=self.store.recovery_codes(self.user)
+        win=tk.Toplevel(self.root);win.title('Save recovery codes offline')
+        ttk.Label(win,text='Each code works once. Creating codes invalidates previous codes.').pack(padx=15,pady=10)
+        text=tk.Text(win,width=45,height=10);text.pack(padx=15,pady=10)
+        text.insert('1.0','\n'.join(codes));text.configure(state='disabled')
+
     def sign_in(self):
         username=self.user_field.get().strip().lower()
         password=self.pass_field.get()
         if not self.store.has_users():
             messagebox.showwarning('Setup required','Create the admin account first.');self.first_run();return
-        if self.login_failures>=5:
-            messagebox.showwarning('Login limited','Too many wrong attempts. Close and reopen the application.');return
         role=self.store.login(username,password)
         self.pass_field.delete(0,'end')
         if not role:
             self.login_failures+=1
             self.store.log(username or '(blank)','Failed login')
-            messagebox.showerror('Login failed','Incorrect username or password.')
+            messagebox.showerror('Login failed','Incorrect credentials or account temporarily locked. After repeated failures, wait 15 minutes.')
             return
         self.user=username;self.role=role
         self.store.log(username,'Signed in')
@@ -436,7 +458,7 @@ class App:
         for title,callback in [('Unit Dashboard',self.unit_dashboard),('Add Section',self.add_section),('Delete Section',self.delete_section),
                                ('Check Clashes',self.check_clashes),('Period Timing / Layout',self.period_layout_editor),('Backup Data',self.backup),
                                ('Accounts',self.manage_users),('Change Password',self.change_password),
-                               ('Login History',self.login_history),('Logout',self.logout)]:
+                               ('Recovery Codes',self.create_recovery_codes),('Login History',self.login_history),('Logout',self.logout)]:
             ttk.Button(row2,text=title,command=callback).pack(side='left',padx=2,pady=2)
 
         info_bar=tk.Frame(self.root,bg=LIGHT)
@@ -1175,6 +1197,17 @@ class App:
         self.store.close();self.root.destroy()
 
 if __name__=='__main__':
-    root=tk.Tk()
-    app=App(root)
-    root.mainloop()
+    if '--smoke-test' in sys.argv:
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            os.environ['APMHSS_DB_PATH']=str(Path(temporary)/'smoke.sqlite3')
+            os.environ.pop('APMHSS_DATA_KEY',None)
+            root=tk.Tk()
+            app=App(root)
+            root.update_idletasks()
+            app.store.close()
+            root.destroy()
+    else:
+        root=tk.Tk()
+        app=App(root)
+        root.mainloop()

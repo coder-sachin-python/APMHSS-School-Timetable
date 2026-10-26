@@ -5,6 +5,9 @@ The scheduler *detects* known teacher conflicts and refuses impossible requests;
 assignment data must be entered to make clash checks meaningful.
 """
 from __future__ import annotations
+from storage_security import (connect_database, configure_backups, backup_database,
+                              security_schema, secure_login, issue_recovery_codes, recover_account)
+from contextlib import closing
 import hashlib
 import json
 import sys
@@ -131,7 +134,7 @@ class Store:
                 if not source_path.is_file() or source_path.resolve() == self.path:
                     continue
                 try:
-                    with sqlite3.connect(str(source_path)) as source:
+                    with closing(sqlite3.connect(str(source_path))) as source:
                         def columns(table):
                             return {row[1] for row in source.execute(f'PRAGMA table_info({table})')}
                         compatible = (
@@ -142,17 +145,19 @@ class Store:
                         )
                         if not compatible:
                             continue
-                        with sqlite3.connect(str(self.path)) as destination:
+                        with closing(sqlite3.connect(str(self.path))) as destination:
                             source.backup(destination)
                     break
                 except sqlite3.DatabaseError:
                     # Never replace an incompatible legacy DB or a corrupt file.
                     continue
-        self.db = sqlite3.connect(str(self.path), timeout=15)
+        self.db = connect_database(self.path, timeout=15)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA busy_timeout=15000')
         self.db.execute('PRAGMA foreign_keys=ON')
         self._schema()
+        security_schema(self.db)
+        configure_backups(self.db)
 
     def _schema(self):
         self.db.executescript('''
@@ -313,7 +318,7 @@ class Store:
         dest=Path(dest).resolve()
         if dest==self.path: raise TimetableError('Choose a different file for your backup.')
         dest.parent.mkdir(parents=True,exist_ok=True)
-        with sqlite3.connect(str(dest)) as other: self.db.backup(other)
+        backup_database(self.db, dest)
 
     def has_users(self): return bool(self.db.execute('SELECT 1 FROM users LIMIT 1').fetchone())
     def add_user(self,username,password,role='viewer'):
@@ -326,13 +331,13 @@ class Store:
         with self.db: self.db.execute('INSERT INTO users(username,salt,password_hash,role,kdf_iterations) VALUES(?,?,?,?,?)',(username,salt,digest,role,310000))
 
     def login(self,username,password):
-        row=self.db.execute('SELECT * FROM users WHERE username=?',(username.strip().lower(),)).fetchone()
-        if not row:
-            # Equal work for unknown usernames to reduce timing differences.
-            hashlib.pbkdf2_hmac('sha256',password.encode(),b'0'*16,310000)
-            return None
-        digest=hashlib.pbkdf2_hmac('sha256',password.encode(),row['salt'],row['kdf_iterations'])
-        return row['role'] if hmac.compare_digest(digest,row['password_hash']) else None
+        return secure_login(self, username, password)
+
+    def recovery_codes(self, username):
+        return issue_recovery_codes(self, username)
+
+    def recover(self, username, code, password):
+        return recover_account(self, username, code, password)
 
     def set_password(self,username,password):
         if not strong_password(password): raise TimetableError('Use 8+ characters, with letters and numbers.')

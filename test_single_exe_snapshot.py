@@ -30,7 +30,7 @@ class SingleExeTests(unittest.TestCase):
                 store = Store()
                 self.assertEqual(store.login('admin', 'Password123'), 'admin')
                 self.assertEqual(store.weekly_plan('12', 'B1')['Tamil'], 5)
-                self.assertEqual(store.path, root / 'LocalAppData' / 'APMHSS_Time_Table' / 'school_timetable.sqlite3')
+                self.assertEqual(store.path, (root / 'LocalAppData' / 'APMHSS_Time_Table' / 'school_timetable.sqlite3').resolve())
                 store.set_password('admin', 'NewPassword123')
                 store.close()
                 reopened = Store()
