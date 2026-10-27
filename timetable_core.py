@@ -5,6 +5,7 @@ The scheduler *detects* known teacher conflicts and refuses impossible requests;
 assignment data must be entered to make clash checks meaningful.
 """
 from __future__ import annotations
+import calendar
 import hashlib
 import json
 import sys
@@ -16,34 +17,35 @@ import re
 import shutil
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 SCHOOL = 'ADHIPARASAKTHI MATRICULATION HIGHER SECONDARY SCHOOL'
 DAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
-GRADES = ('LKG', 'UKG', *map(str, range(1, 13)))
+GRADES = ('Pre KG', 'LKG', 'UKG', *map(str, range(1, 13)))
 UNIT_GRADES = {
-    'Unit 1': ('LKG', 'UKG', '1'),
-    'Unit 2': ('2', '3', '4', '5'),
-    'Unit 3': ('6', '7', '8'),
-    'Unit 4': ('9', '10'),
-    'Unit 5': ('11', '12'),
+    'Unit 1 (KG–2)': ('Pre KG', 'LKG', 'UKG', '1', '2'),
+    'Unit 2 (3–5)': ('3', '4', '5'),
+    'Unit 3 (6–8)': ('6', '7', '8'),
+    'Unit 4 (9–12)': ('9', '10', '11', '12'),
 }
 
 def unit_for_grade(grade):
     return next((unit for unit, grades in UNIT_GRADES.items() if grade in grades), 'Unit 1')
 
 def weekly_capacity(grade):
-    return len(school_days(grade)) * len(PERIODS[group(grade)])
+    return len(school_days(grade)) * len(CLASS_PERIODS.get(grade, PERIODS[group(grade)]))
 
-DEFAULT_SECTIONS = {g: (('A', 'B1', 'B2', 'C1', 'C2') if g in ('11', '12') else ('A', 'B', 'C')) for g in GRADES}
+DEFAULT_SECTIONS = {g: (('A', 'B', 'C1', 'C2') if g in ('11', '12') else ('A', 'B', 'C')) for g in GRADES}
 
 # Original project's grade-specific subject choices and special activities.
 SENIOR_SUBJECTS = {
     'A': ['Tamil','English','Maths','Physics','Chemistry','Biology'],
     'B1': ['Tamil','English','Maths','Physics','Chemistry','Comp. Sci'],
     'B2': ['Tamil','English','Physics','Chemistry','Comp. Sci','Biology'],
+    'B': ['Tamil','English','Physics','Chemistry','Comp. Sci','Maths / Biology'],
     'C1': ['Tamil','English','Bus. Maths','Economics','Accounts','Commerce'],
     'C2': ['Tamil','English','Economics','Accounts','Comp. App','Commerce'],
 }
@@ -55,6 +57,38 @@ PERIODS = {
     'middle': [('09:00','09:45'),('09:45','10:30'),('10:45','11:40'),('11:40','12:50'),('01:20','02:00'),('02:00','02:40'),('02:50','03:10')],
     'higher': [('08:45','09:30'),('09:30','10:50'),('11:00','12:30'),('01:00','02:20'),('02:30','03:30'),('03:30','04:30')],
 }
+
+# New CLASS timings only. Revision retains the historical PERIODS above.
+# Timings are editable per section in the existing Period Timing / Layout screen.
+CLASS_PERIODS = {
+    **{g: PERIODS['primary'] for g in ('Pre KG','LKG','UKG','1','2','3','4','5')},
+    **{g: [
+        ('09:00','09:40'),('09:40','10:20'),
+        ('10:30','11:15'),('11:15','12:00'),
+        ('12:35','13:15'),('13:15','13:55'),
+        ('14:05','14:45'),('14:45','15:30')]
+       for g in ('6','7','8')},
+    '9': [
+        ('09:00','09:40'),('09:40','10:20'),
+        ('10:35','11:15'),('11:15','11:55'),
+        ('12:55','13:35'),('13:35','14:15'),
+        ('14:30','15:10'),('15:10','15:50'),('15:50','16:30')],
+    **{g: [
+        ('08:45','09:30'),('09:30','10:15'),
+        ('10:25','11:10'),('11:10','11:55'),('11:55','12:40'),
+        ('13:20','14:05'),('14:05','14:50'),
+        ('15:00','15:45'),('15:45','16:30')]
+       for g in ('10','11','12')},
+}
+
+SENIOR_LABELS = {'A':'Biology','B':'Computer–Maths / Biology','B1':'Computer–Maths','B2':'Computer–Biology',
+                 'C1':'BM','C2':'CA'}
+
+def section_display(grade, section):
+    if grade in ('11','12'):
+        return f'{section} - {SENIOR_LABELS[section]}' if section in SENIOR_LABELS else section
+    return section
+
 
 def group(grade):
     return 'middle' if grade in ('6','7','8') else 'higher' if grade in ('9','10','11','12') else 'primary'
@@ -85,7 +119,11 @@ def default_subjects(grade, section):
         return ['Tamil','English','Maths','Physics','Biology','Social Sci','Comp. Sci'], ['Sakthi Neri','French','STEM','Hindi']
     if grade == '10':
         return ['Tamil','English','Maths','Science','Social'], []
-    return list(SENIOR_SUBJECTS.get(section, SENIOR_SUBJECTS['A'])), ([] if grade=='12' else ['Sakthi Neri'])
+    return list(SENIOR_SUBJECTS.get(section.split(' - ')[0], SENIOR_SUBJECTS['A'])), ([] if grade=='12' else ['Sakthi Neri'])
+
+def teacher_set(value):
+    """For a split Maths/Biology lesson, check BOTH teachers for clashes."""
+    return {name.strip().casefold() for name in str(value).split(' / ') if name.strip()}
 
 def strong_password(password):
     return len(password) >= 8 and any(c.isalpha() for c in password) and any(c.isdigit() for c in password)
@@ -103,7 +141,8 @@ class Slot:
     fg: str = '#243043'
 
 class Store:
-    def __init__(self, path=None):
+    def __init__(self, path=None, kind='class'):
+        self.kind = kind
         # A one-file EXE can contain a READ-ONLY snapshot of the database.
         # SQLite requires a WRITABLE database while the application runs.
         # On the first run, extract the bundled snapshot to LOCALAPPDATA.
@@ -114,7 +153,14 @@ class Store:
                    else Path(__file__).resolve().parent)
         local_data = (Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
                       / 'APMHSS_Time_Table' / 'school_timetable.sqlite3')
-        default_location = local_data if frozen else app_dir / 'data' / 'school_timetable.sqlite3'
+        # Portable package: database stays next to the executable and moves
+        # automatically when the WHOLE PORTABLE_APP folder is copied.
+        # This is a real writable SQLite file, not an embedded EXE database.
+        portable = (os.environ.get('APMHSS_PORTABLE') == '1' or
+                    (app_dir / '.APMHSS_PORTABLE').is_file())
+        portable_location = app_dir / 'school_timetable.sqlite3'
+        default_location = (portable_location if portable else
+                            local_data if frozen else app_dir / 'data' / 'school_timetable.sqlite3')
         location = path or os.environ.get('APMHSS_DB_PATH') or default_location
         self.path = Path(location).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +199,9 @@ class Store:
         self.db.execute('PRAGMA busy_timeout=15000')
         self.db.execute('PRAGMA foreign_keys=ON')
         self._schema()
+        if self.kind=='class':
+            self._migrate_senior_b()
+            self._import_pdf_reference()
 
     def _schema(self):
         self.db.executescript('''
@@ -187,9 +236,23 @@ class Store:
         CREATE TABLE IF NOT EXISTS student_counts (
           grade TEXT NOT NULL, section TEXT NOT NULL, students INTEGER NOT NULL,
           PRIMARY KEY(grade,section));
+        CREATE TABLE IF NOT EXISTS subject_access (
+          username TEXT NOT NULL, grade TEXT NOT NULL, section TEXT NOT NULL,
+          subject TEXT NOT NULL, PRIMARY KEY(username,grade,section,subject));
         CREATE TABLE IF NOT EXISTS audit (
           id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
           username TEXT NOT NULL, event TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pdf_reference_pages (
+          page INTEGER PRIMARY KEY, grade TEXT NOT NULL, section TEXT NOT NULL,
+          original_class TEXT NOT NULL, page_text TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pdf_reference_teachers (
+          page INTEGER NOT NULL, grade TEXT NOT NULL, section TEXT NOT NULL,
+          teacher TEXT NOT NULL, subject TEXT NOT NULL,
+          PRIMARY KEY(page,grade,section,teacher,subject));
+        CREATE TABLE IF NOT EXISTS teacher_profiles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         ''')
         # Upgrade old user tables without deleting stored accounts.
         columns = {r['name'] for r in self.db.execute('PRAGMA table_info(users)')}
@@ -205,11 +268,73 @@ class Store:
                 if legacy_digest:
                     self.db.execute('UPDATE users SET kdf_iterations=250000')
         with self.db:
+            for senior_grade in ('11','12'):
+                self.db.execute('INSERT OR IGNORE INTO sections(grade,section) VALUES(?,?)',(senior_grade,'B'))
             if not self.db.execute("SELECT 1 FROM settings WHERE key='sections_seeded'").fetchone():
                 for grade, sections in DEFAULT_SECTIONS.items():
                     for sec in sections:
                         self.db.execute('INSERT OR IGNORE INTO sections VALUES(?,?)',(grade,sec))
                 self.db.execute("INSERT INTO settings VALUES('sections_seeded','yes')")
+
+    def _migrate_senior_b(self):
+        """Non-destructively copy legacy B1/B2 into one B stream, keeping originals."""
+        if self.db.execute("SELECT 1 FROM settings WHERE key='senior_b_merged_2026'").fetchone():return
+        with self.db:
+            for grade in ('11','12'):
+                for old in ('B1','B2'):
+                    self.db.execute('''INSERT OR IGNORE INTO schedules
+                        (year,month,week,grade,section,day,period,subject,teacher_override,bg,fg)
+                        SELECT year,month,week,grade,'B',day,period,subject,teacher_override,bg,fg
+                        FROM schedules WHERE grade=? AND section=?''',(grade,old))
+                self.db.execute('''UPDATE schedules SET subject='Maths / Biology'
+                    WHERE grade=? AND section='B' AND lower(subject) IN ('maths','biology')''',(grade,))
+                self.db.execute('''INSERT OR IGNORE INTO student_counts(grade,section,students)
+                    SELECT grade,'B',students FROM student_counts WHERE grade=? AND section='B1' ''',(grade,))
+                self.db.execute('''INSERT OR IGNORE INTO subject_access(username,grade,section,subject)
+                    SELECT username,grade,'B',CASE WHEN lower(subject) IN ('maths','biology')
+                    THEN 'Maths / Biology' ELSE subject END FROM subject_access
+                    WHERE grade=? AND section IN ('B1','B2')''',(grade,))
+                self.db.execute('''INSERT OR IGNORE INTO assignments(grade,section,subject,teacher)
+                    SELECT grade,'B',subject,teacher FROM assignments
+                    WHERE grade=? AND section='B1' AND lower(subject) NOT IN ('maths','biology')''',(grade,))
+                maths=self.db.execute("SELECT teacher FROM assignments WHERE grade=? AND section='B1' AND lower(subject)='maths'",(grade,)).fetchone()
+                bio=self.db.execute("SELECT teacher FROM assignments WHERE grade=? AND section='B2' AND lower(subject)='biology'",(grade,)).fetchone()
+                combined=' / '.join(dict.fromkeys([x[0] for x in (maths,bio) if x and x[0]]))
+                if combined:
+                    self.db.execute("INSERT OR IGNORE INTO assignments(grade,section,subject,teacher) VALUES(?,'B','Maths / Biology',?)",(grade,combined))
+            self.db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('senior_b_merged_2026','yes')")
+
+    def _import_pdf_reference(self):
+        """Import 65-page PDF reference text and teacher/subject candidates once.
+
+        Teacher candidates are stored for review, not silently approved for
+        live scheduling; incorrect assignments could create false clashes.
+        """
+        if self.db.execute("SELECT 1 FROM settings WHERE key='pdf_reference_imported_2026'").fetchone():
+            return
+        bundled=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
+        seed=bundled/'reference_seed.json'
+        if not seed.is_file():return
+        try:
+            with seed.open(encoding='utf-8') as f:payload=json.load(f)
+            with self.db:
+                for item in payload['pages']:
+                    self.db.execute('INSERT OR IGNORE INTO pdf_reference_pages (page,grade,section,original_class,page_text) VALUES(?,?,?,?,?)',
+                      (item['page'],item['grade'],item['section'],item['original_class'],item['text']))
+                    grade,section=item['grade'],item['section']
+                    if grade in GRADES and section and (grade not in ('11','12') or section in ('A','B','C1','C2')):
+                        self.db.execute('INSERT OR IGNORE INTO sections(grade,section) VALUES(?,?)',(grade,section))
+                for item in payload['teachers']:
+                    self.db.execute('INSERT OR IGNORE INTO pdf_reference_teachers (page,grade,section,teacher,subject) VALUES(?,?,?,?,?)',
+                      (item['page'],item['grade'],item['section'],item['teacher'],item['subject']))
+                self.db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('pdf_reference_imported_2026','yes')")
+        except (OSError,ValueError,sqlite3.DatabaseError,KeyError) as error:
+            print('PDF reference import skipped:',error)
+
+    def pdf_teacher_choices(self,grade,section):
+        rows=self.db.execute('SELECT DISTINCT teacher,subject FROM pdf_reference_teachers WHERE grade=? AND section=? ORDER BY subject,teacher',
+                             (grade,section)).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self): self.db.close()
     def layout(self, grade, section):
@@ -219,7 +344,8 @@ class Store:
         if row:
             return DAYS[:row['day_count']], [tuple(t) for t in json.loads(row['period_times'])]
         # Convert old 12-hour labels to unambiguous 24-hour labels.
-        original = PERIODS[group(grade)]
+        original = (PERIODS[group(grade)] if self.kind=='revision'
+                    else CLASS_PERIODS.get(grade, PERIODS[group(grade)]))
         return school_days(grade), [(f'{minutes(a)//60:02d}:{minutes(a)%60:02d}',
                                      f'{minutes(b)//60:02d}:{minutes(b)%60:02d}') for a,b in original]
 
@@ -313,7 +439,7 @@ class Store:
         dest=Path(dest).resolve()
         if dest==self.path: raise TimetableError('Choose a different file for your backup.')
         dest.parent.mkdir(parents=True,exist_ok=True)
-        with sqlite3.connect(str(dest)) as other: self.db.backup(other)
+        with closing(sqlite3.connect(str(dest))) as other: self.db.backup(other)
 
     def has_users(self): return bool(self.db.execute('SELECT 1 FROM users LIMIT 1').fetchone())
     def add_user(self,username,password,role='viewer'):
@@ -340,15 +466,228 @@ class Store:
         digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,310000)
         with self.db: self.db.execute('UPDATE users SET salt=?,password_hash=?,kdf_iterations=310000 WHERE username=?',(salt,digest,username))
 
+    def rename_user(self, old_username, new_username):
+        old_username = old_username.strip().lower()
+        new_username = new_username.strip().lower()
+        if not re.fullmatch(r'[a-z][a-z0-9_]{2,31}', new_username):
+            raise TimetableError('Username must be 3–32 letters/digits/underscores and start with a letter.')
+        if not self.db.execute('SELECT 1 FROM users WHERE username=?',(old_username,)).fetchone():
+            raise TimetableError('User not found.')
+        if self.db.execute('SELECT 1 FROM users WHERE username=?',(new_username,)).fetchone():
+            raise TimetableError('That username is already taken.')
+        with self.db:
+            self.db.execute('UPDATE users SET username=? WHERE username=?',(new_username,old_username))
+            self.db.execute('UPDATE subject_access SET username=? WHERE username=?',(new_username,old_username))
+        return new_username
+
+    def update_credentials(self, old_username, new_username, new_password=None):
+        """Update username and optional password in one transaction."""
+        old_username=old_username.strip().lower()
+        new_username=new_username.strip().lower()
+        if not re.fullmatch(r'[a-z][a-z0-9_]{2,31}',new_username):
+            raise TimetableError('Username must be 3–32 letters/digits/underscores and start with a letter.')
+        if not self.db.execute('SELECT 1 FROM users WHERE username=?',(old_username,)).fetchone():
+            raise TimetableError('Current account was not found.')
+        if new_username != old_username and self.db.execute('SELECT 1 FROM users WHERE username=?',(new_username,)).fetchone():
+            raise TimetableError('That username is already taken.')
+        if new_password and not strong_password(new_password):
+            raise TimetableError('Password needs 8+ characters, with letters and numbers.')
+        salt=os.urandom(16) if new_password else None
+        digest=hashlib.pbkdf2_hmac('sha256',new_password.encode(),salt,310000) if new_password else None
+        with self.db:
+            if new_username!=old_username:
+                self.db.execute('UPDATE users SET username=? WHERE username=?',(new_username,old_username))
+                self.db.execute('UPDATE subject_access SET username=? WHERE username=?',(new_username,old_username))
+            if new_password:
+                self.db.execute('UPDATE users SET salt=?,password_hash=?,kdf_iterations=310000 WHERE username=?',
+                                (salt,digest,new_username))
+        return new_username
+
+    def grant_subject(self,username,grade,section,subject):
+        username=username.strip().lower()
+        if not self.db.execute('SELECT 1 FROM users WHERE username=?',(username,)).fetchone():
+            raise TimetableError('Create the teacher account first.')
+        if grade not in GRADES or section not in self.sections(grade):
+            raise TimetableError('Choose a valid class and section.')
+        subject=subject.strip()
+        if not subject or len(subject)>65:raise TimetableError('Choose a valid subject.')
+        with self.db:self.db.execute('INSERT OR IGNORE INTO subject_access VALUES(?,?,?,?)',
+                                     (username,grade,section,subject))
+
+    def revoke_subject(self,username,grade,section,subject):
+        with self.db:self.db.execute('DELETE FROM subject_access WHERE username=? AND grade=? AND section=? AND subject=?',
+                                     (username.strip().lower(),grade,section,subject))
+
+    def grants(self,username,grade=None,section=None):
+        query='SELECT grade,section,subject FROM subject_access WHERE username=?'
+        params=[username.strip().lower()]
+        if grade is not None:query+=' AND grade=?';params.append(grade)
+        if section is not None:query+=' AND section=?';params.append(section)
+        return [tuple(row) for row in self.db.execute(query+' ORDER BY grade,section,subject',params)]
+
+    def ensure_assigned_schedule(self, context, subject):
+        """Create and save a missing schedule when a teacher is granted a subject.
+
+        Never replace an existing timetable or invent a subject outside its
+        configured plan. Both class and revision modes keep independent data.
+        Returns (available, explanation). A grant alone is not a lesson.
+        """
+        year, month, week, grade, section = context
+        normalized = str(subject).strip().casefold()
+        if not normalized:
+            return False, 'Choose a subject.'
+        plan = self.weekly_plan(grade, section)
+        if normalized not in {name.strip().casefold() for name in plan}:
+            return False, 'This subject is not in the weekly subject plan for this class/section. Add it in Unit Dashboard first.'
+        existing = self.load(context)
+        if existing:
+            found = any(slot.subject.strip().casefold() == normalized for slot in existing.values())
+            return found, ('Subject already appears in this saved timetable.' if found else
+                           'This saved timetable has no period for that subject. Review the existing schedule as administrator.')
+        # Do not replace other weeks or any previously saved schedule.
+        try:
+            slots = Scheduler(self).generate(context)
+            if not any(slot.subject.strip().casefold() == normalized for slot in slots.values()):
+                return False, 'The generated timetable did not contain the selected subject.'
+            self.save(context, slots)
+            return True, 'Timetable generated and automatically saved to SQLite.'
+        except (TimetableError, ValueError) as error:
+            return False, str(error)
+
+    def authorized_contexts(self, username, grade=None, section=None):
+        """Only saved class/week contexts containing this user's granted subjects.
+
+        A grant is not a scheduled lesson: a viewer must never see another
+        subject simply because a class/section matches. Works for either the
+        class or independent revision database when called on that Store.
+        """
+        if grade is not None and grade not in GRADES:
+            return []
+        # Pass the grants from the main accounts database via the UI when
+        # looking in the separate revision store; see contexts_for_subjects.
+        return self.contexts_for_subjects(self.grants(username,grade,section))
+
+    def contexts_for_subjects(self, grants):
+        """Find saved year/month/week/class/section containing authorized lessons."""
+        result=set()
+        for grade,section,subject in grants:
+            rows=self.db.execute("""SELECT DISTINCT year,month,week FROM schedules
+                WHERE grade=? AND section=? AND lower(trim(subject))=?""",
+                (grade,section,str(subject).strip().lower())).fetchall()
+            result.update((row['year'],row['month'],row['week'],grade,section) for row in rows)
+        month_numbers={name:index for index,name in enumerate(calendar.month_name) if name}
+        def order(ctx):
+            try: week=int(ctx[2].split()[-1])
+            except (ValueError,IndexError):week=0
+            return (ctx[0],month_numbers.get(ctx[1],0),week,ctx[3],ctx[4])
+        return sorted(result,key=order,reverse=True)
+
+    def scoped_load(self,context,allowed):
+        # Only return rows for authorized subjects.
+        if not allowed:return {}
+        # Subject names in historical schedules may differ only in capitalization
+        # or surrounding spaces from an administrator's grant.  Keep all other
+        # subjects hidden; do not grant access by a partial/substring match.
+        normalized={str(name).strip().casefold() for name in allowed}
+        return {key:slot for key,slot in self.load(context).items()
+                if slot.subject.strip().casefold() in normalized}
+
+    def save_subject_edits(self,context,changes,allowed):
+        # Update only authorized cells; never overwrite other lessons.
+        allowed={str(name).strip().casefold() for name in allowed}
+        if not allowed:raise TimetableError('No subjects assigned to this account.')
+        original=self.load(context)
+        merged=dict(original)
+        for key,slot in changes.items():
+            if (key not in original or original[key].subject.strip().casefold() not in allowed
+                    or slot.subject.strip().casefold() not in allowed):
+                raise TimetableError('You may edit only your assigned subjects.')
+            if key!=(slot.day,slot.period):raise TimetableError('Invalid timetable position.')
+            merged[key]=slot
+        self.validate(context,merged)
+        year,month,week,grade,section=context
+        with self.db:
+            for (day,period),slot in changes.items():
+                cursor=self.db.execute('''UPDATE schedules SET subject=?,teacher_override=?,bg=?,fg=?
+                    WHERE year=? AND month=? AND week=? AND grade=? AND section=? AND day=? AND period=? AND subject=?''',
+                    (slot.subject,slot.teacher,slot.bg,slot.fg,year,month,week,grade,section,day,period,
+                     original[(day,period)].subject))
+                if cursor.rowcount!=1:raise TimetableError('Timetable changed; reload and try again.')
+
+    def teacher_profiles(self):
+        return self.db.execute('SELECT id,name,description FROM teacher_profiles ORDER BY name COLLATE NOCASE').fetchall()
+
+    def add_teacher_profile(self,name,description=''):
+        name=str(name).strip();description=str(description).strip()
+        if not name or len(name)>100 or len(description)>500:
+            raise TimetableError('Teacher name must be 1–100 characters and description at most 500.')
+        with self.db:
+            return self.db.execute('INSERT INTO teacher_profiles(name,description) VALUES(?,?)',
+                                   (name,description)).lastrowid
+
+    def update_teacher_profile(self,identifier,name,description=''):
+        name=str(name).strip();description=str(description).strip()
+        if not name or len(name)>100 or len(description)>500:
+            raise TimetableError('Teacher name must be 1–100 characters and description at most 500.')
+        with self.db:
+            cursor=self.db.execute('UPDATE teacher_profiles SET name=?,description=? WHERE id=?',
+                                   (name,description,int(identifier)))
+            if cursor.rowcount!=1:raise TimetableError('Teacher not found.')
+
+    def delete_teacher_profile(self,identifier):
+        with self.db:
+            self.db.execute('DELETE FROM teacher_profiles WHERE id=?',(int(identifier),))
+
+    def get_setting(self,key,default=None):
+        row=self.db.execute('SELECT value FROM settings WHERE key=?',(str(key),)).fetchone()
+        return row['value'] if row else default
+
+    def set_setting(self,key,value):
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                            (str(key),str(value)))
+
     def log(self,username,event):
         with self.db: self.db.execute('INSERT INTO audit(created_at,username,event) VALUES(?,?,?)',(datetime.now().isoformat(timespec='seconds'),username,event))
 
+    def clear_history(self, username):
+        """Delete previous audit entries and record the administrator's action."""
+        with self.db:
+            self.db.execute('DELETE FROM audit')
+            self.db.execute('INSERT INTO audit(created_at,username,event) VALUES(?,?,?)',
+                            (datetime.now().isoformat(timespec='seconds'),
+                             str(username), 'Administrator cleared login history'))
+
     def sections(self,grade):
-        return [r[0] for r in self.db.execute('SELECT section FROM sections WHERE grade=? ORDER BY section',(grade,))]
+        found=[r[0] for r in self.db.execute('SELECT section FROM sections WHERE grade=? ORDER BY section',(grade,))]
+        if grade in ('11','12'):
+            return [s for s in found if s not in ('B1','B2')]
+        return found
     def add_section(self,grade,section):
         section=section.strip().upper()
         if not re.fullmatch('[A-Z][A-Z0-9]{0,5}',section): raise TimetableError('Section must be 1-6 letters/numbers, starting with a letter.')
         with self.db: self.db.execute('INSERT INTO sections VALUES(?,?)',(grade,section))
+    def rename_section(self, grade, old_section, new_section):
+        """Rename a section atomically, preserving all its linked timetable records."""
+        new_section = str(new_section).strip().upper()
+        if not re.fullmatch(r'[A-Z][A-Z0-9 -]{0,23}', new_section):
+            raise TimetableError('Use 1-24 letters, numbers, spaces or hyphens; start with a letter.')
+        if old_section not in self.sections(grade):
+            raise TimetableError('The original section does not exist.')
+        if new_section == old_section:
+            return new_section
+        if any(sec.casefold() == new_section.casefold() for sec in self.sections(grade)):
+            raise TimetableError('A section with that name already exists in this class.')
+        tables = ('sections', 'assignments', 'rules', 'schedules',
+                  'weekly_subject_periods', 'weekly_plan_enabled',
+                  'student_counts', 'timetable_layout', 'subject_access')
+        with self.db:
+            for table in tables:
+                self.db.execute(
+                    f'UPDATE {table} SET section=? WHERE grade=? AND section=?',
+                    (new_section, grade, old_section))
+        return new_section
+
     def delete_section(self,grade,section):
         if len(self.sections(grade)) <= 1: raise TimetableError('At least one section must remain.')
         with self.db:
@@ -360,6 +699,7 @@ class Store:
             self.db.execute('DELETE FROM schedules WHERE grade=? AND section=?',(grade,section))
             self.db.execute('DELETE FROM student_counts WHERE grade=? AND section=?',(grade,section))
             self.db.execute('DELETE FROM timetable_layout WHERE grade=? AND section=?',(grade,section))
+            self.db.execute('DELETE FROM subject_access WHERE grade=? AND section=?',(grade,section))
 
     def has_weekly_plan(self,grade,section):
         return bool(self.db.execute('SELECT 1 FROM weekly_plan_enabled WHERE grade=? AND section=?',
@@ -538,7 +878,7 @@ class Store:
             if not teacher: continue
             for other in others:
                 ot=other['teacher_override'].strip() or self.teacher_for(other['grade'],other['section'],other['subject'])
-                if (ot.casefold()==teacher.casefold() and ot and slot.day==other['day'] and
+                if (teacher_set(ot) & teacher_set(teacher) and slot.day==other['day'] and
                     self.periods_overlap(grade,section,slot.period,other['grade'],other['section'],other['period'])):
                     errors.append(f'{teacher}: {slot.day} period {slot.period+1} in {grade}-{section} '
                                   f'overlaps {other["grade"]}-{other["section"]} period {other["period"]+1}')
@@ -618,10 +958,10 @@ class Scheduler:
         occupied=[]
         for r in other:
             teacher=r['teacher_override'].strip() or self.store.teacher_for(r['grade'],r['section'],r['subject'])
-            if teacher: occupied.append((teacher.casefold(),r['day'],r['grade'],r['section'],r['period']))
+            for name in teacher_set(teacher): occupied.append((name,r['day'],r['grade'],r['section'],r['period']))
         def available(subject,day,period):
-            teacher=self.store.teacher_for(grade,section,subject).casefold()
-            return not teacher or all(not (teacher==oth and day==d and self.store.periods_overlap(grade,section,period,g,other_section,p)) for oth,d,g,other_section,p in occupied)
+            teachers=teacher_set(self.store.teacher_for(grade,section,subject))
+            return not teachers or all(not (oth in teachers and day==d and self.store.periods_overlap(grade,section,period,g,other_section,p)) for oth,d,g,other_section,p in occupied)
         for attempt in range(350):
             rng=random.Random(seed+attempt*2039)
             schedule={k:Slot(k[0],k[1],v) for k,v in fixed.items()}
@@ -675,13 +1015,14 @@ class Scheduler:
             teacher = (row['teacher_override'].strip() or
                        self.store.teacher_for(row['grade'],row['section'],row['subject']))
             if teacher:
-                occupied.append((teacher.casefold(),row['day'],row['grade'],row['section'],row['period']))
+                occupied.extend((name,row['day'],row['grade'],row['section'],row['period']) for name in teacher_set(teacher))
 
         def available(slot,day,period):
             teacher = (slot.teacher.strip() or
-                       self.store.teacher_for(grade,section,slot.subject)).casefold()
-            return not teacher or all(
-                not (teacher == t and day == d and self.store.periods_overlap(grade,section,period,g,other_section,p))
+                       self.store.teacher_for(grade,section,slot.subject))
+            teachers=teacher_set(teacher)
+            return not teachers or all(
+                not (t in teachers and day == d and self.store.periods_overlap(grade,section,period,g,other_section,p))
                 for t,d,g,other_section,p in occupied)
 
         result = {}
@@ -752,11 +1093,11 @@ class Scheduler:
         occupied=[]
         for row in other:
             teacher=row['teacher_override'].strip() or self.store.teacher_for(row['grade'],row['section'],row['subject'])
-            if teacher:occupied.append((teacher.casefold(),row['day'],row['grade'],row['section'],row['period']))
+            if teacher:occupied.extend((name,row['day'],row['grade'],row['section'],row['period']) for name in teacher_set(teacher))
         def available(subject,day,p):
             if subject=='---':return True
-            teacher=self.store.teacher_for(grade,section,subject).strip().casefold()
-            return not teacher or all(not (teacher==t and day==d and self.store.periods_overlap(grade,section,p,g,other_section,q))
+            teachers=teacher_set(self.store.teacher_for(grade,section,subject))
+            return not teachers or all(not (t in teachers and day==d and self.store.periods_overlap(grade,section,p,g,other_section,q))
                                       for t,d,g,other_section,q in occupied)
         for (day,p),subject in fixed.items():
             if not available(subject,day,p):
